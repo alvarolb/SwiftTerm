@@ -253,7 +253,8 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     {
         showsHorizontalScrollIndicator = true
         indicatorStyle = .white
-        
+        delegate = self
+
         setupKeyboardButtonColors()
         setupDisplayUpdates ();
         setupOptions ()
@@ -1130,13 +1131,38 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         let displayBuffer = terminal.displayBuffer
         contentSize = CGSize (width: CGFloat (displayBuffer.cols) * cellDimension.width,
                               height: CGFloat (displayBuffer.lines.count) * cellDimension.height)
-        //contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
-        contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
-        //Xscroller.doubleValue = scrollPosition
-        //Xscroller.knobProportion = scrollThumbsize
+        // Only auto-scroll to bottom if the user hasn't scrolled up
+        if !userScrolling {
+            contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
+        }
     }
     
     var userScrolling = false
+
+    // MARK: - UIScrollViewDelegate
+
+    public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        userScrolling = true
+        terminal.userScrolling = true
+    }
+
+    public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate {
+            checkIfScrolledToBottom()
+        }
+    }
+
+    public func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        checkIfScrolledToBottom()
+    }
+
+    private func checkIfScrolledToBottom() {
+        let bottomOffset = contentSize.height - bounds.height
+        if contentOffset.y >= bottomOffset - cellDimension.height {
+            userScrolling = false
+            terminal.userScrolling = false
+        }
+    }
 
     func getCurrentGraphicsContext () -> CGContext?
     {
