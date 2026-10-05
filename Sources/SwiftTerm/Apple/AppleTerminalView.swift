@@ -1088,8 +1088,10 @@ extension TerminalView {
             if !pendingText.isEmpty, let attrs = pendingAttrs {
                 builder?.append(text: pendingText, attributes: attrs,
                                 cellUTF16Lengths: pendingCellLengths)
-                pendingText = ""
-                pendingCellLengths = []
+                // A row with many attribute runs flushes many times; keep
+                // the batch storage instead of reallocating it per run.
+                pendingText.removeAll(keepingCapacity: true)
+                pendingCellLengths.removeAll(keepingCapacity: true)
             }
         }
 
