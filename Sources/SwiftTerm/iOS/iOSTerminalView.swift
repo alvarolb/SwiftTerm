@@ -573,14 +573,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             fallBackToCoreGraphics(error: MetalError.commandQueueUnavailable)
             return
         }
-        replaceMetalRendererAfterFailure()
+        // See MacTerminalView: only a command buffer that ended in error
+        // casts doubt on the atlas contents.
+        replaceMetalRendererAfterFailure(reusingCaches: report.commandBufferStatus != .error)
     }
 
     func metalRendererDidBecomeIdle(_ renderer: MetalTerminalRenderer) {
         retiredMetalRenderers.removeAll { $0 === renderer && renderer.isIdle }
     }
 
-    private func replaceMetalRendererAfterFailure() {
+    private func replaceMetalRendererAfterFailure(reusingCaches: Bool = true) {
         guard let oldView = metalView,
               let device = oldView.device ?? MTLCreateSystemDefaultDevice() else {
             fallBackToCoreGraphics(error: MetalError.deviceUnavailable)
@@ -597,9 +599,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 #endif
 
         let newView = makeMetalView(frame: oldView.frame, device: device)
+        let oldRenderer = metalRenderer
+        oldRenderer?.invalidateForReplacement()
         let newRenderer: MetalTerminalRenderer
         do {
-            newRenderer = try MetalTerminalRenderer(view: newView, terminalView: self)
+            newRenderer = try MetalTerminalRenderer(view: newView,
+                                                    terminalView: self,
+                                                    inheritingCachesFrom: reusingCaches ? oldRenderer : nil)
         } catch {
             fallBackToCoreGraphics(error: error)
             return
@@ -607,7 +613,6 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         newView.delegate = newRenderer
         insertMetalView(newView, replacing: oldView)
 
-        let oldRenderer = metalRenderer
         metalView = newView
         metalRenderer = newRenderer
         retireMetalRenderer(oldRenderer)

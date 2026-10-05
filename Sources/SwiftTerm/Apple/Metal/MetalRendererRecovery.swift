@@ -278,7 +278,16 @@ final class MetalFrameCoordinator {
         return token
     }
 
-    func refuse(_ token: Token, reason: MetalFrameRefusalReason) {
+    /// Releases a frame that could not be submitted.
+    ///
+    /// A `transient` refusal is one the caller can explain without a GPU
+    /// failure: the surface has no drawable because the view is being
+    /// live-resized or its drawable size just changed, so the layer is
+    /// still allocating the new backing. Such a refusal is still retried,
+    /// but it neither starts nor extends a failure episode: the 1 s failure
+    /// watchdog would otherwise replace a healthy renderer (and throw away
+    /// its glyph atlas) right after a window resize.
+    func refuse(_ token: Token, reason: MetalFrameRefusalReason, transient: Bool = false) {
         var notifyIdle = false
         lock.lock()
         guard activeFrame?.token == token else {
@@ -288,7 +297,9 @@ final class MetalFrameCoordinator {
         activeFrame?.watchdog?.cancel()
         activeFrame = nil
         notifyIdle = true
-        startFailureEpisodeLocked(reason: reason)
+        if !transient {
+            startFailureEpisodeLocked(reason: reason)
+        }
         scheduleRetryLocked(reason: reason)
         lock.unlock()
         if notifyIdle {

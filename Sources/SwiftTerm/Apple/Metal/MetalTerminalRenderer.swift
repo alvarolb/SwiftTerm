@@ -254,11 +254,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let sampler: MTLSamplerState
     private let textureLoader: MTKTextureLoader
     private let bufferPool: BufferPool
-    private let shaperCache = ShaperCache(maxEntries: 2048)
+    private let shaperCache: ShaperCache
     private let grayscaleAtlas: GlyphAtlas
     private let colorAtlas: GlyphAtlas
     private let rasterizer = CoreTextGlyphRasterizer()
-    private let fontIdentities = FontIdentityCache()
+    private let fontIdentities: FontIdentityCache
     private var glyphCache: [GlyphKey: GlyphEntry] = [:]
     private var scaledFontCache: [ScaledFontKey: CTFont] = [:]
     private var customGlyphCache: [CustomGlyphKey: CustomGlyphEntry] = [:]
@@ -316,7 +316,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var kittyTextureFailures: Set<UInt32> = []
 #endif
 
-    init(view: MTKView, terminalView: TerminalView) throws {
+    /// Creates a renderer for `view`.
+    ///
+    /// When `previous` is a retired renderer on the same device, the new one
+    /// takes over its glyph atlases and the caches keyed on them, so a
+    /// window rebind or a watchdog recovery does not re-rasterize every
+    /// glyph on screen. The previous renderer must already be invalidated
+    /// (``invalidateForReplacement()``), as it will never draw again. Pass
+    /// `nil` after a real command-buffer error, when the GPU-side contents
+    /// of the atlases cannot be trusted.
+    init(view: MTKView, terminalView: TerminalView, inheritingCachesFrom previous: MetalTerminalRenderer? = nil) throws {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
             throw MetalError.deviceUnavailable
         }
@@ -329,16 +338,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             throw MetalError.commandQueueUnavailable
         }
         self.commandQueue = commandQueue
-        guard let grayscaleAtlas = GlyphAtlas(device: device,
-                                              maxSize: GlyphAtlas.recommendedMaxSize(device: device, format: .grayscale),
-                                              format: .grayscale),
-              let colorAtlas = GlyphAtlas(device: device,
-                                          maxSize: GlyphAtlas.recommendedMaxSize(device: device, format: .bgra),
-                                          format: .bgra) else {
-            throw MetalError.atlasUnavailable
+        if let previous, previous.device === device {
+            self.grayscaleAtlas = previous.grayscaleAtlas
+            self.colorAtlas = previous.colorAtlas
+            self.fontIdentities = previous.fontIdentities
+            self.shaperCache = previous.shaperCache
+            self.glyphCache = previous.glyphCache
+            self.scaledFontCache = previous.scaledFontCache
+            self.customGlyphCache = previous.customGlyphCache
+        } else {
+            guard let grayscaleAtlas = GlyphAtlas(device: device,
+                                                  maxSize: GlyphAtlas.recommendedMaxSize(device: device, format: .grayscale),
+                                                  format: .grayscale),
+                  let colorAtlas = GlyphAtlas(device: device,
+                                              maxSize: GlyphAtlas.recommendedMaxSize(device: device, format: .bgra),
+                                              format: .bgra) else {
+                throw MetalError.atlasUnavailable
+            }
+            self.grayscaleAtlas = grayscaleAtlas
+            self.colorAtlas = colorAtlas
+            self.fontIdentities = FontIdentityCache()
+            self.shaperCache = ShaperCache(maxEntries: 2048)
         }
-        self.grayscaleAtlas = grayscaleAtlas
-        self.colorAtlas = colorAtlas
         let library = try MetalTerminalRenderer.makeLibrary(device: device)
         guard let textPipeline = MetalTerminalRenderer.makeTextPipeline(device: device,
                                                                         library: library,
@@ -441,10 +462,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if let layer = view.layer, layer.contentsScale != scale {
             layer.contentsScale = scale
         }
+        let inLiveResize = view.inLiveResize
 #else
         let scale = terminalView.backingScaleFactor()
+        let inLiveResize = false
 #endif
-        view.drawableSize = CGSize(width: view.bounds.width * scale, height: view.bounds.height * scale)
+        let drawableSize = CGSize(width: view.bounds.width * scale, height: view.bounds.height * scale)
+        let drawableSizeChanged = view.drawableSize != drawableSize
+        if drawableSizeChanged {
+            view.drawableSize = drawableSize
+        }
+        // While the window is being resized, or right after the drawable
+        // size changed, the layer may legitimately have no drawable to hand
+        // out yet. That is not a renderer failure; see
+        // MetalFrameCoordinator.refuse(_:reason:transient:).
+        let surfaceInTransition = inLiveResize || drawableSizeChanged
         let cursorStyle = terminalView.terminal.options.cursorStyle
         let shouldBlink = isBlinkStyle(cursorStyle)
             && !terminalView.terminal.cursorHidden
@@ -477,11 +509,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 #endif
         guard let drawable else {
-            frameCoordinator.refuse(frameToken, reason: .missingDrawable)
+            frameCoordinator.refuse(frameToken, reason: .missingDrawable, transient: surfaceInTransition)
             return
         }
         guard let passDescriptor else {
-            frameCoordinator.refuse(frameToken, reason: .missingRenderPassDescriptor)
+            frameCoordinator.refuse(frameToken, reason: .missingRenderPassDescriptor, transient: surfaceInTransition)
             return
         }
 #if canImport(os)

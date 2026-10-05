@@ -244,6 +244,58 @@ private final class TestMetalRecoveryScheduler: MetalRecoveryScheduler {
         #expect(reports.first?.reason == .missingRenderEncoder)
     }
 
+    @Test func transientRefusalRetriesWithoutStartingFailureEpisode() throws {
+        let clock = TestMetalRecoveryClock()
+        let scheduler = TestMetalRecoveryScheduler()
+        var reports: [MetalRendererRecoveryReport] = []
+        let coordinator = makeCoordinator(
+            clock: clock,
+            scheduler: scheduler,
+            recoveries: { reports.append($0) }
+        )
+
+        // A live resize keeps the layer without a drawable for longer than
+        // the watchdog delay; none of these refusals is a failure.
+        for step in 0..<8 {
+            clock.now = Double(step) * 0.25
+            let token = try #require(coordinator.beginFrame())
+            coordinator.refuse(token, reason: .missingDrawable, transient: true)
+            #expect(coordinator.isIdle)
+            #expect(scheduler.activeWatchdogs.isEmpty)
+        }
+        #expect(scheduler.activeRetryTasks.count == 1)
+
+        // A submitted frame afterwards is business as usual.
+        let token = try #require(coordinator.beginFrame())
+        coordinator.didSubmit(token, status: { .completed }, error: { nil })
+        coordinator.complete(token, status: .completed, error: nil)
+
+        #expect(reports.isEmpty)
+    }
+
+    @Test func transientRefusalDoesNotResetAnExistingFailureEpisode() throws {
+        let clock = TestMetalRecoveryClock()
+        let scheduler = TestMetalRecoveryScheduler()
+        var reports: [MetalRendererRecoveryReport] = []
+        let coordinator = makeCoordinator(
+            clock: clock,
+            scheduler: scheduler,
+            recoveries: { reports.append($0) }
+        )
+        let token = try #require(coordinator.beginFrame())
+        coordinator.refuse(token, reason: .missingRenderEncoder)
+        clock.now = 0.5
+        let secondToken = try #require(coordinator.beginFrame())
+        coordinator.refuse(secondToken, reason: .missingDrawable, transient: true)
+        clock.now = 1
+
+        try #require(scheduler.activeWatchdogs.first).run()
+
+        #expect(reports.count == 1)
+        #expect(reports.first?.reason == .missingRenderEncoder)
+        #expect(reports.first?.failureDuration == 1)
+    }
+
 #if DEBUG
     @Test func frameGateWithoutValidOwnerRequestsReplacement() throws {
         let clock = TestMetalRecoveryClock()

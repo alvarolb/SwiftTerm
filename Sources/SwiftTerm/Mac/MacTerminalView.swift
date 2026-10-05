@@ -568,9 +568,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         let newView = makeMetalView(frame: oldView.frame, device: device)
 
+        let oldRenderer = metalRenderer
+        oldRenderer?.invalidateForReplacement()
         let newRenderer: MetalTerminalRenderer
         do {
-            newRenderer = try MetalTerminalRenderer(view: newView, terminalView: self)
+            // Nothing failed on the GPU: keep the glyph atlas and caches.
+            newRenderer = try MetalTerminalRenderer(view: newView,
+                                                    terminalView: self,
+                                                    inheritingCachesFrom: oldRenderer)
         } catch {
             disableMetalRendererAfterRebindFailure(error: error)
             return
@@ -589,7 +594,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         newView.draw()
         newView.setNeedsDisplay(newView.bounds)
 
-        let oldRenderer = metalRenderer
         oldView.delegate = nil
         oldView.removeFromSuperview()
 
@@ -670,14 +674,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             disableMetalRendererAfterRebindFailure(error: MetalError.commandQueueUnavailable)
             return
         }
-        replaceMetalRendererAfterFailure()
+        // A command buffer that finished with an error may have left the
+        // atlas textures in an unknown state; anything else (a stalled
+        // frame, a starved drawable) is a surface problem and the glyphs
+        // rasterized so far are still good.
+        replaceMetalRendererAfterFailure(reusingCaches: report.commandBufferStatus != .error)
     }
 
     func metalRendererDidBecomeIdle(_ renderer: MetalTerminalRenderer) {
         retiredMetalRenderers.removeAll { $0 === renderer && renderer.isIdle }
     }
 
-    private func replaceMetalRendererAfterFailure() {
+    private func replaceMetalRendererAfterFailure(reusingCaches: Bool = true) {
         guard let oldView = metalView,
               let device = oldView.device ?? MTLCreateSystemDefaultDevice() else {
             disableMetalRendererAfterRebindFailure(error: MetalError.deviceUnavailable)
@@ -694,9 +702,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 #endif
 
         let newView = makeMetalView(frame: oldView.frame, device: device)
+        let oldRenderer = metalRenderer
+        oldRenderer?.invalidateForReplacement()
         let newRenderer: MetalTerminalRenderer
         do {
-            newRenderer = try MetalTerminalRenderer(view: newView, terminalView: self)
+            newRenderer = try MetalTerminalRenderer(view: newView,
+                                                    terminalView: self,
+                                                    inheritingCachesFrom: reusingCaches ? oldRenderer : nil)
         } catch {
             disableMetalRendererAfterRebindFailure(error: error)
             return
@@ -704,7 +716,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         newView.delegate = newRenderer
         insertMetalView(newView, replacing: oldView)
 
-        let oldRenderer = metalRenderer
         metalView = newView
         metalRenderer = newRenderer
         metalBoundWindow = window
