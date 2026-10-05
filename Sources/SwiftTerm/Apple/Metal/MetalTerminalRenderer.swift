@@ -2980,7 +2980,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Shader libraries resolved so far, one per device. Resolving one means
+    /// probing the default library and then scanning candidate resource
+    /// bundles on disk (`Bundle(url:)`, directory listings), which profiled
+    /// at ~80% of renderer init. A renderer is created on every window
+    /// rebind and every recovery, so pay for the scan once per process. The
+    /// device is retained alongside its library so its identifier cannot be
+    /// recycled by a different device.
+    private static let libraryCacheLock = NSLock()
+    private static var libraryCache: [ObjectIdentifier: (device: MTLDevice, library: MTLLibrary)] = [:]
+
     private static func makeLibrary(device: MTLDevice) throws -> MTLLibrary {
+        let key = ObjectIdentifier(device)
+        libraryCacheLock.lock()
+        if let cached = libraryCache[key], cached.device === device {
+            libraryCacheLock.unlock()
+            return cached.library
+        }
+        libraryCacheLock.unlock()
+        let library = try loadLibrary(device: device)
+        libraryCacheLock.lock()
+        libraryCache[key] = (device, library)
+        libraryCacheLock.unlock()
+        return library
+    }
+
+    private static func loadLibrary(device: MTLDevice) throws -> MTLLibrary {
         if let library = device.makeDefaultLibrary(),
            libraryHasRequiredFunctions(library) {
             return library
