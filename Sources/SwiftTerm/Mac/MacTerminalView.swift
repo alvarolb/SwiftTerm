@@ -798,7 +798,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         updateTextBlinkLifecycle()
 #if canImport(MetalKit)
         updateMetalWindowRecoveryObservers()
-        guard useMetalRenderer, let currentWindow = window else { return }
+        guard useMetalRenderer else { return }
+        guard let currentWindow = window else {
+            // The layer's drawables are window-sized IOSurfaces (three per
+            // view). A detached view cannot present, and hosts that keep
+            // many terminals alive off-window had to call setUseMetal(false)
+            // to get that memory back. The view is paused and draws on
+            // demand, so the next attach recreates them with the
+            // requestMetalDisplay() below.
+            metalView?.releaseDrawables()
+            return
+        }
         if currentWindow !== metalBoundWindow {
             rebindMetalRendererToWindow(currentWindow)
         }
