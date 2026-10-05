@@ -262,6 +262,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var glyphCache: [GlyphKey: GlyphEntry] = [:]
     private var scaledFontCache: [ScaledFontKey: CTFont] = [:]
     private var customGlyphCache: [CustomGlyphKey: CustomGlyphEntry] = [:]
+    /// Memoizes `colorToSIMD` by color object identity for the duration of
+    /// one frame. The view hands the renderer the same few cached NSColor
+    /// objects for every cell, but converting each one goes through a
+    /// colorspace conversion, which showed up per cell in profiles. The memo
+    /// is cleared at the start of each frame rather than kept across frames
+    /// because dynamic (appearance-aware) colors resolve differently once the
+    /// appearance changes, and that can only happen between frames. Entries
+    /// retain their color so an identifier cannot be recycled mid-frame.
+    private var colorCache: [ObjectIdentifier: (color: TTColor, value: SIMD4<Float>)] = [:]
     private let imageTextureCache = NSMapTable<AnyObject, MTLTexture>(keyOptions: .weakMemory, valueOptions: .strongMemory)
     private var kittyTextureCache: [UInt32: (signature: KittyImageSignature, texture: MTLTexture)] = [:]
     private var rowCache: [Int: RowCacheEntry] = [:]
@@ -687,6 +696,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             grayscaleAtlas.frozen = false
             colorAtlas.frozen = false
         }
+        colorCache.removeAll(keepingCapacity: true)
         var attempt = 0
         while true {
             if attempt == Self.maxAtlasRebuildPasses {
@@ -2134,6 +2144,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     private func colorToSIMD(_ color: TTColor) -> SIMD4<Float> {
+        let key = ObjectIdentifier(color)
+        if let cached = colorCache[key] {
+            return cached.value
+        }
+        let value = convertColorToSIMD(color)
+        // Truecolor content can produce an unbounded number of distinct
+        // colors in one frame; keep the memo from growing without limit.
+        if colorCache.count >= 4096 {
+            colorCache.removeAll(keepingCapacity: true)
+        }
+        colorCache[key] = (color, value)
+        return value
+    }
+
+    private func convertColorToSIMD(_ color: TTColor) -> SIMD4<Float> {
         #if os(macOS)
         let rgb = color.usingColorSpace(.deviceRGB) ?? color
         var r: CGFloat = 0
