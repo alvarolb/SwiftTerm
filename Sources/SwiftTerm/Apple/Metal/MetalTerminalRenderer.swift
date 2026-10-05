@@ -12,10 +12,64 @@ import AppKit
 import UIKit
 #endif
 
-struct GlyphKey: Hashable {
-    let fontName: String
+/// Identifies a font by PostScript name and point size: two CTFont objects
+/// that agree on both rasterize identical glyphs, which is all the glyph
+/// and shaping caches care about.
+struct FontIdentity: Hashable {
+    let name: String
     let size: CGFloat
+}
+
+/// Hands out a small integer id per ``FontIdentity`` and remembers which
+/// CTFont objects resolved to which id, so the per-glyph hot paths key their
+/// caches on `(fontId, glyph)` instead of paying for
+/// `CTFontCopyPostScriptName` plus String bridging and hashing on every
+/// glyph of every rebuilt row (~35% of row rebuilding in profiles).
+///
+/// Every cached font is retained for as long as its `ObjectIdentifier` is
+/// in the table, so an identifier cannot be recycled by a different font
+/// and no name/size re-verification is needed on the hit path. Ids are
+/// never reused, so clearing the object table (to bound retention) keeps
+/// every outstanding glyph-cache key valid.
+final class FontIdentityCache {
+    private var idsByIdentity: [FontIdentity: UInt32] = [:]
+    private var idsByObject: [ObjectIdentifier: (font: CTFont, id: UInt32)] = [:]
+    private let maxRetainedFonts: Int
+
+    init(maxRetainedFonts: Int = 1024) {
+        self.maxRetainedFonts = maxRetainedFonts
+    }
+
+    func id(for font: CTFont) -> UInt32 {
+        let key = ObjectIdentifier(font)
+        if let cached = idsByObject[key] {
+            return cached.id
+        }
+        let identity = FontIdentity(name: CTFontCopyPostScriptName(font) as String,
+                                    size: CTFontGetSize(font))
+        let id: UInt32
+        if let existing = idsByIdentity[identity] {
+            id = existing
+        } else {
+            id = UInt32(idsByIdentity.count)
+            idsByIdentity[identity] = id
+        }
+        if idsByObject.count >= maxRetainedFonts {
+            idsByObject.removeAll(keepingCapacity: true)
+        }
+        idsByObject[key] = (font, id)
+        return id
+    }
+}
+
+struct GlyphKey: Hashable {
+    let fontId: UInt32
     let glyph: CGGlyph
+}
+
+struct ScaledFontKey: Hashable {
+    let fontId: UInt32
+    let scaleBits: UInt64
 }
 
 struct GlyphEntry {
@@ -204,8 +258,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let grayscaleAtlas: GlyphAtlas
     private let colorAtlas: GlyphAtlas
     private let rasterizer = CoreTextGlyphRasterizer()
+    private let fontIdentities = FontIdentityCache()
     private var glyphCache: [GlyphKey: GlyphEntry] = [:]
-    private var scaledFontCache: [GlyphKey: CTFont] = [:]
+    private var scaledFontCache: [ScaledFontKey: CTFont] = [:]
     private var customGlyphCache: [CustomGlyphKey: CustomGlyphEntry] = [:]
     private let imageTextureCache = NSMapTable<AnyObject, MTLTexture>(keyOptions: .weakMemory, valueOptions: .strongMemory)
     private var kittyTextureCache: [UInt32: (signature: KittyImageSignature, texture: MTLTexture)] = [:]
@@ -1590,7 +1645,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     return
                 }
                 let runFont = attributes[.font] as? TTFont ?? terminalView.fontSet.normal
-                guard let shaped = shaperCache.shape(text: text, font: runFont as CTFont) else {
+                let ctFont = runFont as CTFont
+                guard let shaped = shaperCache.shape(text: text,
+                                                     font: ctFont,
+                                                     fontId: fontIdentities.id(for: ctFont)) else {
                     return
                 }
                 shapedRuns.append(ShapedRun(attributes: attributes,
@@ -1623,9 +1681,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     private func glyphEntry(for font: CTFont, glyph: CGGlyph) -> GlyphEntry? {
-        let key = GlyphKey(fontName: CTFontCopyPostScriptName(font) as String,
-                           size: CTFontGetSize(font),
-                           glyph: glyph)
+        let key = GlyphKey(fontId: fontIdentities.id(for: font), glyph: glyph)
         if let cached = glyphCache[key] {
             return cached
         }
@@ -1651,9 +1707,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     private func scaledFontFor(font: CTFont, scale: CGFloat) -> CTFont {
-        let key = GlyphKey(fontName: CTFontCopyPostScriptName(font) as String,
-                           size: CTFontGetSize(font) * scale,
-                           glyph: 0)
+        let key = ScaledFontKey(fontId: fontIdentities.id(for: font),
+                                scaleBits: Double(scale).bitPattern)
         if let cached = scaledFontCache[key] {
             return cached
         }
@@ -1967,8 +2022,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     private struct ShaperKey: Hashable {
-        let fontName: String
-        let fontSize: CGFloat
+        let fontId: UInt32
         let text: String
     }
 
@@ -2006,13 +2060,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             self.maxEntries = maxEntries
         }
 
-        func shape(text: String, font: CTFont) -> ShaperRun? {
+        func shape(text: String, font: CTFont, fontId: UInt32) -> ShaperRun? {
             guard !text.isEmpty else {
                 return nil
             }
-            let key = ShaperKey(fontName: CTFontCopyPostScriptName(font) as String,
-                                fontSize: CTFontGetSize(font),
-                                text: text)
+            let key = ShaperKey(fontId: fontId, text: text)
             if let cached = cache[key] {
                 return cached
             }
