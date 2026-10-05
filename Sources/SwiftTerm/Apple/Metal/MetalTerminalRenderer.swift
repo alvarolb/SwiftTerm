@@ -259,7 +259,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let colorAtlas: GlyphAtlas
     private let rasterizer = CoreTextGlyphRasterizer()
     private let fontIdentities: FontIdentityCache
-    private var glyphCache: [GlyphKey: GlyphEntry] = [:]
+    /// `nil` values are negative entries: glyphs with no outline (spaces,
+    /// zero-width marks) are the most common cells on screen, and without
+    /// remembering them every rebuilt row asked CoreText for their bounds
+    /// again on every frame.
+    private var glyphCache: [GlyphKey: GlyphEntry?] = [:]
     private var scaledFontCache: [ScaledFontKey: CTFont] = [:]
     private var customGlyphCache: [CustomGlyphKey: CustomGlyphEntry] = [:]
     /// Memoizes `colorToSIMD` by color object identity for the duration of
@@ -1728,6 +1732,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return cached
         }
         guard let bitmap = rasterizer.rasterize(font: font, glyph: glyph) else {
+            glyphCache.updateValue(nil, forKey: key)
             return nil
         }
         let atlasKind: GlyphAtlasKind = bitmap.isColor ? .color : .grayscale
